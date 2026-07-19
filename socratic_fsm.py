@@ -13,6 +13,11 @@ class AgentState(TypedDict):
     frustration_streak: int
     didactic_triggered: bool
     pii_blocked: bool
+    turn_count: int
+    last_node: str
+    intent: str
+    session_active: bool
+    total_frustration_events: int 
 
 CHROMA_PATH = "./chroma_db"
 
@@ -37,19 +42,25 @@ def calculate_frustration(text: str) -> float:
     return min(1.0, matches * 0.25)
 
 def input_guard_node(state: AgentState) -> dict:
-    """Evaluates inbound message compliance, blocking PII before reaching any LLM."""
     last_message = state["messages"][-1].content
     if scan_for_pii(str(last_message)):
         return {
             "messages": [AIMessage(content="[SAFETY BLOCK]: Please refrain from sharing private identifiers.")],
-            "pii_blocked": True
+            "pii_blocked": True,
+            "intent": "PII_Violation",
+            "session_active": False,
+            "last_node": "TerminateNode"
         }
-    return {"pii_blocked": False}
+    return {"pii_blocked": False, "intent": "None", "session_active": True, "last_node": "input_guard"}
 
 def socratic_tutor_node(state: AgentState) -> dict:
     last_user_message = state["messages"][-1].content
     score = calculate_frustration(str(last_user_message))
     new_streak = state.get("frustration_streak", 0) + 1 if score > 0.2 else 0
+    
+    # Increment frustration count metric if frustration is identified
+    frust_inc = 1 if score > 0.2 else 0
+    total_frust = state.get("total_frustration_events", 0) + frust_inc
 
     try:
         db = get_vector_db()
@@ -59,7 +70,7 @@ def socratic_tutor_node(state: AgentState) -> dict:
         context = "No syllabus reference loaded. Rely on standard Computer Science curriculum guidance."
 
     llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.2)
-
+    
     system_prompt = (
         "You are an empathetic, scaffolding Socratic Computer Science tutor. "
         "Never supply the outright programming, hardware, or algorithm answers. "
@@ -71,22 +82,27 @@ def socratic_tutor_node(state: AgentState) -> dict:
     for m in state["messages"]:
         m_type = getattr(m, "type", "")
         role = "user" if (isinstance(m, HumanMessage) or m_type == "human") else "assistant"
-        full_history.append({"role": role, "content": str(m.content)})
+        msg_content = str(m.content).strip()
+        if not msg_content:
+            msg_content = "[Empty message sent by user]"
+        full_history.append({"role": role, "content": msg_content})
     
     response = llm.invoke(full_history)
-    
+
     if isinstance(response.content, list) and len(response.content) > 0:
-        if isinstance(response.content[0], dict) and 'text' in response.content[0]:
-            clean_text = response.content[0]['text']
-        else:
-            clean_text = str(response.content[0])
+        clean_text = response.content[0]['text'] if isinstance(response.content[0], dict) else str(response.content[0])
     else:
         clean_text = str(response.content)
     
     return {
         "messages": [AIMessage(content=clean_text)],
         "frustration_score": score,
-        "frustration_streak": new_streak
+        "frustration_streak": new_streak,
+        "total_frustration_events": total_frust,
+        "last_node": "socratic_tutor_node",
+        "turn_count": state.get("turn_count", 0) + 1,
+        "intent": "None",
+        "session_active": True
     }
 
 def didactic_fallback_node(state: AgentState) -> dict:
@@ -99,7 +115,7 @@ def didactic_fallback_node(state: AgentState) -> dict:
         context = "Standard CS syllabus rules."
 
     llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.0)
-   
+    
     system_prompt = (
         "You have exited Socratic mode because the conversation turn limit has been met.\n"
         "Deliver a direct, highly structured, concise technical answer that targets ONLY "
@@ -112,22 +128,27 @@ def didactic_fallback_node(state: AgentState) -> dict:
     for m in state["messages"]:
         m_type = getattr(m, "type", "")
         role = "user" if (isinstance(m, HumanMessage) or m_type == "human") else "assistant"
-        full_history.append({"role": role, "content": str(m.content)})
+        msg_content = str(m.content).strip()
+        if not msg_content:
+            msg_content = "[Empty message sent by user]"
+        full_history.append({"role": role, "content": msg_content})
     
     response = llm.invoke(full_history)
     
     if isinstance(response.content, list) and len(response.content) > 0:
-        if isinstance(response.content[0], dict) and 'text' in response.content[0]:
-            clean_text = response.content[0]['text']
-        else:
-            clean_text = str(response.content[0])
+        clean_text = response.content[0]['text'] if isinstance(response.content[0], dict) else str(response.content[0])
     else:
         clean_text = str(response.content)
-    
+
     return {
         "messages": [AIMessage(content=clean_text)],
-        "frustration_streak": 0,  
-        "didactic_triggered": True
+        "frustration_score": 0.0,
+        "frustration_streak": 0,
+        "total_frustration_events": state.get("total_frustration_events", 0),
+        "last_node": "AutomatedFadeOut",
+        "turn_count": state.get("turn_count", 0) + 1,
+        "intent": "None",
+        "session_active": True
     }
 
 def gate_route(state: AgentState) -> str:
