@@ -1,7 +1,6 @@
-# socratic_fsm.py
 import os
 import re
-from typing import TypedDict, Sequence
+from typing import TypedDict, Sequence, Optional
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
@@ -9,6 +8,8 @@ from langgraph.graph import StateGraph, END
 
 class AgentState(TypedDict):
     messages: Sequence[BaseMessage]
+    main_unit: Optional[str]
+    sub_topic: Optional[str]
     frustration_score: float
     frustration_streak: int
     didactic_triggered: bool
@@ -41,6 +42,24 @@ def calculate_frustration(text: str) -> float:
     matches = sum(1 for word in indicators if word in text_lower)
     return min(1.0, matches * 0.25)
 
+def fetch_context(query: str, sub_topic: Optional[str]) -> str:
+    """Helper to perform similarity search with optional sub_topic metadata filtering."""
+    try:
+        db = get_vector_db()
+        if sub_topic:
+            docs = db.similarity_search(query, k=2, filter={"sub_topic": sub_topic})
+        else:
+            docs = db.similarity_search(query, k=2)
+        return "\n---\n".join([d.page_content for d in docs])
+    except Exception:
+        # Fallback if filter returns empty or database lacks metadata tags
+        try:
+            db = get_vector_db()
+            docs = db.similarity_search(query, k=2)
+            return "\n---\n".join([d.page_content for d in docs])
+        except Exception:
+            return "No specific syllabus reference retrieved."
+
 def input_guard_node(state: AgentState) -> dict:
     last_message = state["messages"][-1].content
     if scan_for_pii(str(last_message)):
@@ -57,24 +76,16 @@ def socratic_tutor_node(state: AgentState) -> dict:
     last_user_message = state["messages"][-1].content
     score = calculate_frustration(str(last_user_message))
     new_streak = state.get("frustration_streak", 0) + 1 if score > 0.2 else 0
-    
-    # Increment frustration count metric if frustration is identified
-    frust_inc = 1 if score > 0.2 else 0
-    total_frust = state.get("total_frustration_events", 0) + frust_inc
+    total_frust = state.get("total_frustration_events", 0) + (1 if score > 0.2 else 0)
 
-    try:
-        db = get_vector_db()
-        docs = db.similarity_search(str(last_user_message), k=2)
-        context = "\n---\n".join([d.page_content for d in docs])
-    except Exception:
-        context = "No syllabus reference loaded. Rely on standard Computer Science curriculum guidance."
+    target_topic = state.get("sub_topic", "General Computer Science")
+    context = fetch_context(str(last_user_message), state.get("sub_topic"))
 
     llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.2)
     
     system_prompt = (
-        "You are an empathetic, scaffolding Socratic Computer Science tutor. "
-        "Never supply the outright programming, hardware, or algorithm answers. "
-        "Formulate your response as a single, encouraging guiding question.\n"
+        f"You are an empathetic, scaffolding Socratic Computer Science tutor focusing on: {target_topic}.\n"
+        "Never supply outright answers. Formulate your response as a single, encouraging guiding question.\n"
         f"Syllabus Context:\n{context}"
     )
     
@@ -82,17 +93,12 @@ def socratic_tutor_node(state: AgentState) -> dict:
     for m in state["messages"]:
         m_type = getattr(m, "type", "")
         role = "user" if (isinstance(m, HumanMessage) or m_type == "human") else "assistant"
-        msg_content = str(m.content).strip()
-        if not msg_content:
-            msg_content = "[Empty message sent by user]"
+        msg_content = str(m.content).strip() or "[Empty message sent by user]"
         full_history.append({"role": role, "content": msg_content})
     
     response = llm.invoke(full_history)
 
-    if isinstance(response.content, list) and len(response.content) > 0:
-        clean_text = response.content[0]['text'] if isinstance(response.content[0], dict) else str(response.content[0])
-    else:
-        clean_text = str(response.content)
+    clean_text = response.content[0]['text'] if isinstance(response.content, list) and len(response.content) > 0 and isinstance(response.content[0], dict) else str(response.content)
     
     return {
         "messages": [AIMessage(content=clean_text)],
@@ -107,20 +113,15 @@ def socratic_tutor_node(state: AgentState) -> dict:
 
 def didactic_fallback_node(state: AgentState) -> dict:
     last_user_message = state["messages"][-1].content
-    try:
-        db = get_vector_db()
-        docs = db.similarity_search(str(last_user_message), k=2)
-        context = "\n---\n".join([d.page_content for d in docs])
-    except Exception:
-        context = "Standard CS syllabus rules."
+    target_topic = state.get("sub_topic", "General Computer Science")
+    context = fetch_context(str(last_user_message), state.get("sub_topic"))
 
     llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.0)
     
     system_prompt = (
-        "You have exited Socratic mode because the conversation turn limit has been met.\n"
-        "Deliver a direct, highly structured, concise technical answer that targets ONLY "
-        "the specific sub-topic scope of the student's immediately preceding prompt or error.\n"
-        "Do not dump the entire syllabus context or unrelated network architectures.\n"
+        f"You have exited Socratic mode for topic: {target_topic}.\n"
+        "Deliver a direct, highly structured, concise technical answer targeting ONLY "
+        "the specific concept of the student's prompt. Do not dump unrelated syllabus material.\n"
         f"Syllabus Context:\n{context}"
     )
     
@@ -128,17 +129,11 @@ def didactic_fallback_node(state: AgentState) -> dict:
     for m in state["messages"]:
         m_type = getattr(m, "type", "")
         role = "user" if (isinstance(m, HumanMessage) or m_type == "human") else "assistant"
-        msg_content = str(m.content).strip()
-        if not msg_content:
-            msg_content = "[Empty message sent by user]"
+        msg_content = str(m.content).strip() or "[Empty message sent by user]"
         full_history.append({"role": role, "content": msg_content})
     
     response = llm.invoke(full_history)
-    
-    if isinstance(response.content, list) and len(response.content) > 0:
-        clean_text = response.content[0]['text'] if isinstance(response.content[0], dict) else str(response.content[0])
-    else:
-        clean_text = str(response.content)
+    clean_text = response.content[0]['text'] if isinstance(response.content, list) and len(response.content) > 0 and isinstance(response.content[0], dict) else str(response.content)
 
     return {
         "messages": [AIMessage(content=clean_text)],
