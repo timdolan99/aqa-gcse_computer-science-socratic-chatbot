@@ -1,7 +1,11 @@
 import os
-import tomllib  # Built-in in Python 3.11+
+import tomllib
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-# --- Load Google API Key from Streamlit secrets.toml ---
+# --- Automatically load API key from .streamlit/secrets.toml ---
 secrets_path = os.path.join(".streamlit", "secrets.toml")
 if os.path.exists(secrets_path):
     with open(secrets_path, "rb") as f:
@@ -11,43 +15,37 @@ if os.path.exists(secrets_path):
             os.environ["GOOGLE_API_KEY"] = api_key
             os.environ["GEMINI_API_KEY"] = api_key
 
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
 CHROMA_PATH = "./chroma_db"
 DATA_PATH = "./syllabus"
 
 TOPIC_MAP = {
-    "3.3.1": "AQA 3.3.1: Number Bases & Conversions (Binary, Hex)",
-    "3.3.2": "AQA 3.3.2: Units of Information & Binary Arithmetic",
-    "3.3.3": "AQA 3.3.3: Character Encoding (ASCII & Unicode)",
-    "3.3.4": "AQA 3.3.4: Representing Images & Sound",
-    "3.3.5": "AQA 3.3.5: Data Compression (Huffman & RLE)",
-    "3.4.1": "AQA 3.4.1: Hardware & Software Classification",
-    "3.4.2": "AQA 3.4.2: Systems Architecture (CPU & Von Neumann)",
-    "3.4.3": "AQA 3.4.3: Memory (RAM, ROM & Cache)",
-    "3.4.4": "AQA 3.4.4: Secondary Storage Devices",
-    "3.5.1": "AQA 3.5.1: Network Types & Connections (PAN, LAN, WAN)",
-    "3.5.2": "AQA 3.5.2: Network Topologies & Data Routing (Star, Bus, Packets)",
-    "3.5.3": "AQA 3.5.3: Protocols & The 4-Layer TCP/IP Model",
-    "3.6.1": "AQA 3.6.1: Cyber Security Threats & Attacks",
-    "3.6.2": "AQA 3.6.2: Social Engineering & Malware Methods",
-    "3.6.3": "AQA 3.6.3: Cyber Security Prevention & Detection",
-    "3.7.1": "AQA 3.7.1: Relational Database Concepts & Structure",
-    "3.7.2": "AQA 3.7.2: Primary Keys, Foreign Keys & Relationships",
-    "3.8.1": "AQA 3.8.1: Ethical & Privacy Issues",
-    "3.8.2": "AQA 3.8.2: Environmental Impact of Technology",
-    "3.8.3": "AQA 3.8.3: Computer Legislation (DPA, CMA, Copyright)",
+    "10": "Edexcel Topic 10: Medicine in Britain (c1250–present) & Western Front",
+    "11": "Edexcel Topic 11: Crime and Punishment in Britain (c1000–present)",
+    "12": "Edexcel Topic 12: Warfare and British Society (c1250–present)",
+    "20": "Edexcel Topic 20: Period Study - Superpower Relations and Cold War",
+    "21": "Edexcel Topic 21: Period Study - The American West (c1835–c1895)",
+    "30": "Edexcel Topic 30: Modern Depth Study - Weimar and Nazi Germany (1918–39)",
+    "31": "Edexcel Topic 31: Modern Depth Study - Russia and the Soviet Union (1917–41)",
+    "33": "Edexcel Topic 33: Modern Depth Study - USA (1954–75)",
 }
 
 def detect_subtopic(text: str, filename: str) -> str:
-    combined_str = f"{filename} {text[:300]}"
-    for code, full_label in TOPIC_MAP.items():
-        if code in combined_str:
-            return full_label
-    return "AQA 3.5.1: Network Types & Connections (PAN, LAN, WAN)"
+    combined_str = f"{filename} {text[:400]}".lower()
+    
+    if "medicine" in combined_str:
+        return TOPIC_MAP["10"]
+    elif "crime" in combined_str or "punishment" in combined_str:
+        return TOPIC_MAP["11"]
+    elif "cold war" in combined_str or "superpower" in combined_str:
+        return TOPIC_MAP["20"]
+    elif "american west" in combined_str:
+        return TOPIC_MAP["21"]
+    elif "weimar" in combined_str or "nazi" in combined_str:
+        return TOPIC_MAP["30"]
+    elif "russia" in combined_str or "soviet" in combined_str:
+        return TOPIC_MAP["31"]
+    
+    return "Edexcel Topic 10: Medicine in Britain (c1250–present) & Western Front"
 
 def build_vector_db():
     if not os.path.exists(DATA_PATH):
@@ -55,8 +53,7 @@ def build_vector_db():
         print(f"Created directory {DATA_PATH}.")
         return
 
-    print("Loading PDF syllabus files...")
-    # Configured specifically to load .pdf files
+    print("Loading PDF History syllabus files...")
     loader = DirectoryLoader(DATA_PATH, glob="*.pdf", loader_cls=PyPDFLoader)
     raw_docs = loader.load()
 
@@ -75,7 +72,10 @@ def build_vector_db():
         chunk.metadata["sub_topic"] = detected
 
     print("Generating embeddings and indexing to ChromaDB...")
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview",google_api_key=os.getenv("GOOGLE_API_KEY"))
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-2-preview",
+        google_api_key=os.getenv("GOOGLE_API_KEY")
+    )
     
     db = Chroma.from_documents(
         documents=chunks,
